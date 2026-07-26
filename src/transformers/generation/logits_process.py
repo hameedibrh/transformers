@@ -14,7 +14,7 @@
 
 import inspect
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -1043,7 +1043,7 @@ def _get_ngrams(ngram_size: int, prev_input_ids: torch.Tensor, num_hypos: int):
         # Loop through each n-gram of size ngram_size in the list of tokens (gen_tokens)
         for ngram in zip(*[gen_tokens[i:] for i in range(ngram_size)]):
             prev_ngram_tuple = tuple(ngram[:-1])
-            generated_ngram[prev_ngram_tuple] = generated_ngram.get(prev_ngram_tuple, []) + [ngram[-1]]
+            generated_ngram.setdefault(prev_ngram_tuple, []).append(ngram[-1])
     return generated_ngrams
 
 
@@ -1068,21 +1068,6 @@ def _get_generated_ngrams(banned_ngrams, prev_input_ids, ngram_size, cur_len):
     start_idx = cur_len + 1 - ngram_size
     ngram_idx = tuple(prev_input_ids[start_idx:cur_len].tolist())
     return banned_ngrams.get(ngram_idx, [])
-
-
-def _calc_banned_ngram_tokens(
-    ngram_size: int, prev_input_ids: torch.Tensor, num_hypos: int, cur_len: int
-) -> list[Iterable[int]]:
-    """Copied from fairseq for no_repeat_ngram in beam_search"""
-    if cur_len + 1 < ngram_size:
-        # return no banned tokens if we haven't generated no_repeat_ngram_size tokens yet
-        return [[] for _ in range(num_hypos)]
-    generated_ngrams = _get_ngrams(ngram_size, prev_input_ids, num_hypos)
-    banned_tokens = [
-        _get_generated_ngrams(generated_ngrams[hypo_idx], prev_input_ids[hypo_idx], ngram_size, cur_len)
-        for hypo_idx in range(num_hypos)
-    ]
-    return banned_tokens
 
 
 class NoRepeatNGramLogitsProcessor(LogitsProcessor):
@@ -1134,14 +1119,27 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
 
     @add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        num_batch_hypotheses = scores.shape[0]
         cur_len = input_ids.shape[-1]
-        scores_processed = scores.clone()
-        banned_batch_tokens = _calc_banned_ngram_tokens(self.ngram_size, input_ids, num_batch_hypotheses, cur_len)
-        for i, banned_tokens in enumerate(banned_batch_tokens):
-            scores_processed[i, banned_tokens] = -float("inf")
+        if cur_len < self.ngram_size:
+            # The sequence does not hold a complete ngram yet, so nothing can be banned.
+            return scores
 
-        return scores_processed
+        # Only the ngrams whose first `ngram_size - 1` tokens are the ones we just generated can be completed by the
+        # next token, so we look that single prefix up instead of building every ngram of the sequence. Every window
+        # of `ngram_size` consecutive tokens is compared against the prefix at once, and a window that matches bans
+        # its own last token. The window starting at the prefix itself is not among them (it would need one more
+        # token than the sequence holds), so a prefix can never ban the token that already follows it.
+        prefix = input_ids[:, cur_len + 1 - self.ngram_size :]
+        windows = input_ids.unfold(dimension=1, size=self.ngram_size, step=1)
+        matches = (windows[..., :-1] == prefix.unsqueeze(1)).all(dim=-1)
+
+        # The mask gets one column more than the vocabulary so that the last token of every non-matching window can
+        # be scattered into that spare column and dropped, rather than unbanning a token banned by another window.
+        vocab_size = scores.shape[-1]
+        banned_mask = scores.new_zeros((scores.shape[0], vocab_size + 1), dtype=torch.bool)
+        banned_mask.scatter_(1, torch.where(matches, windows[..., -1], vocab_size), True)
+
+        return scores.masked_fill(banned_mask[:, :vocab_size], -float("inf"))
 
 
 class EncoderNoRepeatNGramLogitsProcessor(LogitsProcessor):
